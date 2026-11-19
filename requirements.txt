@@ -1,0 +1,10 @@
+# 必需
+urllib3>=2.0
+
+# 语音输入
+sounddevice>=0.4.6
+numpy>=1.24
+faster-whisper>=1.0
+
+# 可选（装了才有记忆功能）
+# 灵枢大脑：按 README 克隆到 vendor/lingshu

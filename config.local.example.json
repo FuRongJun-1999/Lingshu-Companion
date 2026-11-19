@@ -1,0 +1,7 @@
+{
+  "_说明": "本文件含登录凭据，已在 .gitignore 中排除，请勿提交或上传",
+  "bilibili": {
+    "room_id": 0,
+    "sessdata": ""
+  }
+}

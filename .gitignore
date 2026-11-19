@@ -1,0 +1,48 @@
+# 个人配置与密钥
+config.local.json
+config/secrets.json
+.env
+
+# 运行时数据（对话记录、观众档案）
+data/
+assets/whale-voice.wav
+assets/whale-voice.txt
+
+# 日志
+*.log
+*.err
+_live.log
+_live.err
+
+# 调试脚本
+_*.py
+_*.png
+_*.wav
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+out/
+
+# 模型（体积大，自行下载）
+models/
+*.moc3
+*.model3.json
+*.png
+!docs/*.png
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 双重保险：任何位置的密钥文件
+**/config/secrets.json
+**/secrets.json
+companion/config/

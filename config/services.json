@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "capabilities": {
+    "asr": {
+      "label": "语音识别",
+      "current": "none",
+      "options": {
+        "none": {
+          "label": "未启用",
+          "kind": "none",
+          "params": {},
+          "note": "开启「语音对话」前需要先选一个识别服务"
+        },
+        "faster_whisper": {
+          "label": "本地 faster-whisper",
+          "kind": "local",
+          "params": {
+            "model": "large-v3",
+            "device": "cuda",
+            "compute_type": "float16",
+            "language": "zh"
+          },
+          "note": "CTranslate2 加速，中文好，吃显存约 3G"
+        }
+      }
+    },
+    "tts": {
+      "label": "语音合成",
+      "current": "voxcpm",
+      "options": {
+        "voxcpm": {
+          "label": "本地 VoxCPM2",
+          "kind": "local",
+          "params": {
+            "url": "http://127.0.0.1:8010",
+            "voice": "whale-voice.wav"
+          },
+          "note": "现有声音，别换"
+        },
+        "edge_tts": {
+          "label": "Edge TTS（微软，免费）",
+          "kind": "cloud",
+          "params": {
+            "voice": "zh-CN-XiaoyiNeural",
+            "rate": "+0%"
+          },
+          "note": "不占显存，音色偏播音腔"
+        }
+      }
+    },
+    "llm": {
+      "label": "语言模型",
+      "current": "deepseek",
+      "options": {
+        "deepseek": {
+          "label": "DeepSeek（云端）",
+          "kind": "cloud",
+          "params": {
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-flash",
+            "thinking": "disabled",
+            "temperature": 0.8,
+            "max_tokens": 120,
+            "key_ref": "deepseek_api_key"
+          },
+          "note": "当前在用，约 1 秒一条"
+        },
+        "ollama": {
+          "label": "Ollama（本地）",
+          "kind": "local",
+          "params": {
+            "base_url": "http://127.0.0.1:11434",
+            "model": "qwen2.5:7b",
+            "temperature": 0.8,
+            "max_tokens": 120
+          },
+          "note": "断网可用，7B 约吃 6G 显存"
+        }
+      }
+    },
+    "vision": {
+      "label": "识图",
+      "current": "none",
+      "options": {
+        "none": {
+          "label": "未启用",
+          "kind": "none",
+          "params": {}
+        },
+        "qwen_vl": {
+          "label": "Qwen-VL（云端）",
+          "kind": "cloud",
+          "params": {
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "model": "qwen-vl-plus",
+            "key_ref": "dashscope_api_key"
+          },
+          "note": "中文场景强，按量计费"
+        },
+        "minicpm_v": {
+          "label": "本地 MiniCPM-V",
+          "kind": "local",
+          "params": {
+            "model": "openbmb/MiniCPM-V-2_6",
+            "device": "cuda"
+          },
+          "note": "吃 8G 显存，速度慢但免费"
+        }
+      }
+    },
+    "image": {
+      "label": "画图",
+      "current": "none",
+      "options": {
+        "none": {
+          "label": "未启用",
+          "kind": "none",
+          "params": {}
+        },
+        "comfyui": {
+          "label": "本地 ComfyUI",
+          "kind": "local",
+          "params": {
+            "url": "http://127.0.0.1:8188",
+            "workflow": "default"
+          },
+          "note": "节点式，直播可实时出图"
+        },
+        "dashscope_image": {
+          "label": "通义万相（云端）",
+          "kind": "cloud",
+          "params": {
+            "model": "wanx-v1",
+            "key_ref": "dashscope_api_key"
+          }
+        }
+      }
+    },
+    "control": {
+      "label": "键鼠控制",
+      "current": "off",
+      "options": {
+        "off": {
+          "label": "关闭（安全）",
+          "kind": "none",
+          "params": {}
+        },
+        "pynput": {
+          "label": "本地 pynput",
+          "kind": "local",
+          "params": {
+            "allow_keys": "WASD,SPACE,ESC",
+            "allow_clicks": true,
+            "max_actions_per_min": 20
+          },
+          "note": "白名单模式，超频自动停"
+        }
+      }
+    }
+  }
+}

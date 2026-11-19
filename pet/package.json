@@ -1,0 +1,9 @@
+{
+  "name": "lingshu-desktop-pet",
+  "version": "0.1.0",
+  "description": "灵枢伴侣 · 桌宠显示端",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  }
+}

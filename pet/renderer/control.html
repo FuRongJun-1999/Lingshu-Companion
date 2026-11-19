@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>control</title>
+<style>
+  html, body {
+    margin:0; padding:0; background:transparent; overflow:hidden;
+    font-family: system-ui, "Microsoft YaHei", sans-serif;
+    -webkit-user-select:none; user-select:none;
+  }
+  /* 整体可拖动：齿轮和面板在同一容器里，拖哪都一起动 */
+  #dock {
+    position: absolute; inset: 0;
+    -webkit-app-region: drag;
+    display: flex; flex-direction: column; align-items: flex-start;
+  }
+  #gear {
+    width: 40px; height: 40px; border-radius: 50%;
+    background: rgba(18,26,40,.9); color: #8cf;
+    border: 1px solid rgba(140,200,255,.45);
+    font-size: 20px; line-height: 38px; text-align: center;
+    cursor: pointer; -webkit-app-region: no-drag;
+    box-shadow: 0 3px 12px rgba(0,0,0,.5);
+    flex: 0 0 auto; margin: 2px;
+  }
+  #gear.on { background: rgba(52,92,142,.95); }
+  #panel {
+    display: none; width: 268px; margin-top: 6px;
+    background: rgba(13,19,29,.96); border: 1px solid rgba(140,200,255,.3);
+    border-radius: 10px; padding: 10px 12px; color: #cde;
+    font-size: 12px; -webkit-app-region: no-drag;
+    box-shadow: 0 8px 26px rgba(0,0,0,.55);
+    overflow-y: auto; max-height: calc(100vh - 56px);
+  }
+  #panel.open { display: block; }
+  .row { display:flex; align-items:center; gap:6px; margin:8px 0; }
+  .row label { flex:0 0 56px; color:#8aa; font-size:11px; }
+  .row input[type=range] { flex:1; height:3px; accent-color:#4af; }
+  .row .val { flex:0 0 48px; text-align:right; color:#7cf;
+              font-variant-numeric:tabular-nums; font-size:11px; }
+  .row select { flex:1; background:rgba(30,42,60,.95); color:#cde;
+                border:1px solid rgba(140,200,255,.28); border-radius:5px;
+                padding:3px 4px; font-size:11px; outline:none; }
+  .sep { height:1px; background:rgba(140,200,255,.16); margin:10px 0; }
+  .btns { display:flex; gap:6px; margin-top:8px; }
+  .btns button { flex:1; background:rgba(30,42,60,.95); color:#9cf;
+                 border:1px solid rgba(140,200,255,.28); border-radius:5px;
+                 padding:4px 0; font-size:11px; cursor:pointer; }
+  .btns button:hover { background:rgba(52,84,124,.95); }
+  .chk { display:flex; align-items:center; gap:6px; margin:6px 0; color:#8aa; font-size:11px; }
+  .chk input { accent-color:#4af; }
+  /* 主功能入口：四个按钮占满两行 */
+  .main { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 4px; }
+  .main button {
+    display: flex; align-items: center; justify-content: center; gap: 5px;
+    background: rgba(24,36,54,.95); color: #bdd; border: 1px solid rgba(140,200,255,.26);
+    border-radius: 7px; padding: 9px 0; font-size: 12px; cursor: pointer;
+    transition: background .15s;
+  }
+  .main button:hover { background: rgba(44,72,108,.95); }
+  .main button.on { background: rgba(52,110,170,.95); color: #fff; border-color: rgba(120,190,255,.6); }
+  .main .ico { font-size: 14px; line-height: 1; }
+  #hint { font-size:10px; color:#567; margin-top:6px; line-height:1.5; }
+</style>
+</head>
+<body>
+<div id="dock">
+  <div id="gear" title="点击开关面板 · 拖动窗口">⚙</div>
+  <div id="panel">
+    <div class="main">
+      <button id="btnChat" title="打开对话页面"><span class="ico">💬</span>聊天</button>
+      <button id="btnVoice" title="开关语音对话"><span class="ico">🎤</span>语音</button>
+      <button id="btnConfig" title="全部功能配置"><span class="ico">⚙</span>详情</button>
+      <button id="btnModel" title="Live2D 模型控制"><span class="ico">🎭</span>模型</button>
+    </div>
+    <div class="sep"></div>
+    <div class="row">
+      <label>窗口大小</label>
+      <input id="pWin" type="range" min="160" max="1400" step="10" value="560">
+      <span class="val" id="vWin">560</span>
+    </div>
+    <div class="row">
+      <label>模型缩放</label>
+      <input id="pZoom" type="range" min="30" max="200" step="1" value="100">
+      <span class="val" id="vZoom">100%</span>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="row">
+      <label>表情</label>
+      <select id="pExpr"><option value="">（不切换）</option></select>
+    </div>
+    <div class="row">
+      <label>动作</label>
+      <select id="pMotion"><option value="">（不播放）</option></select>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="row">
+      <label>帧率</label>
+      <select id="pFps">
+        <option value="30">30</option>
+        <option value="60" selected>60</option>
+        <option value="0">不限</option>
+      </select>
+    </div>
+    <label class="chk"><input id="pBlink" type="checkbox" checked> 自动眨眼</label>
+
+    <div class="btns">
+      <button id="btnEdit">编辑模式</button>
+    </div>
+    <div class="btns">
+      <button id="btnFull">全身</button>
+      <button id="btnBust">上半身</button>
+      <button id="btnClose">特写</button>
+    </div>
+    <div class="btns">
+      <button id="btnPass">穿透</button>
+      <button id="btnHide">隐藏</button>
+    </div>
+    <div id="hint">拖窗口移动 / F8 穿透 / F9 隐藏</div>
+  </div>
+</div>
+<script src="./control.js"></script>
+</body>
+</html>
