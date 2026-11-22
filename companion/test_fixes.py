@@ -9,8 +9,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 import warnings
@@ -266,9 +268,9 @@ def test_inline_scripts_js_syntax(tmp_path):
 
 
 def test_no_syntax_warnings_on_compile():
-    """config_server.py 与 model_server.py 编译不应产生 SyntaxWarning。"""
+    """config_server.py、model_server.py 与 lingshu.py 编译不应产生 SyntaxWarning。"""
     comp_dir = Path(config_server.__file__).resolve().parent
-    for fname in ("config_server.py", "model_server.py"):
+    for fname in ("config_server.py", "model_server.py", "lingshu.py"):
         p = comp_dir / fname
         src = p.read_text(encoding="utf-8")
         with warnings.catch_warnings(record=True) as caught:
@@ -476,3 +478,269 @@ def test_body_ref_b64_and_mouth_sync(tmp_path, monkeypatch):
     monkeypatch.setattr(b2, "_get", lambda p, timeout=1.5: (sent_wav.append(p), True)[1])
     b2._push_mouth(str(wav_file), 200.0)
     assert len(sent_wav) == 2
+
+
+def test_lingshu_code_and_data_root_separation(tmp_path, monkeypatch):
+    """代码目录（LINGSHU_ROOT）与数据目录（MDCG_ROOT / datapath.mdcg_root）应解耦，且兼容显式 root。"""
+    code_dir = tmp_path / "code_repo"
+    (code_dir / "md_cg").mkdir(parents=True)
+    env_data_dir = tmp_path / "env_mdcg_data"
+    mcp_data_dir = tmp_path / "mcp_shared_data"
+    explicit_dir = tmp_path / "explicit_data"
+
+    monkeypatch.setenv("LINGSHU_ROOT", str(code_dir))
+    monkeypatch.delenv("MDCG_ROOT", raising=False)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    # 1. MDCG_ROOT 优先作为数据根，与代码根分离
+    monkeypatch.setenv("MDCG_ROOT", str(env_data_dir))
+    assert lingshu._data_root(code_dir) == env_data_dir
+    mem_default = lingshu.LingshuMemory()
+    assert Path(mem_default.code_root) == code_dir
+    assert Path(mem_default.data_root) == env_data_dir
+    assert Path(mem_default.root) == env_data_dir
+
+    # 2. 显式传 root=... 向后兼容：数据根固定为传入路径，代码根仍自动发现
+    mem_explicit = lingshu.LingshuMemory(root=explicit_dir)
+    assert Path(mem_explicit.data_root) == explicit_dir
+    assert Path(mem_explicit.root) == explicit_dir
+    assert Path(mem_explicit.code_root) == code_dir
+
+    # 3. 未设 MDCG_ROOT 时优先调用 md_cg.datapath.mdcg_root()
+    monkeypatch.delenv("MDCG_ROOT", raising=False)
+    fake_pkg = types.ModuleType("md_cg")
+    fake_dp = types.ModuleType("md_cg.datapath")
+    fake_dp.mdcg_root = lambda: str(mcp_data_dir)
+    fake_pkg.datapath = fake_dp
+    monkeypatch.setitem(sys.modules, "md_cg", fake_pkg)
+    monkeypatch.setitem(sys.modules, "md_cg.datapath", fake_dp)
+    assert lingshu._data_root(code_dir) == mcp_data_dir
+    assert Path(mem_default.data_root) == mcp_data_dir
+
+    # 4. datapath 不可用时回落到 code_dir
+    monkeypatch.setitem(sys.modules, "md_cg", None)
+    monkeypatch.setitem(sys.modules, "md_cg.datapath", None)
+    assert lingshu._data_root(code_dir) == code_dir
+
+
+def test_lingshu_async_flush_and_writer_thread_sync_flush(tmp_path, monkeypatch):
+    """支持 async_flush 时传 False，不支持时兼容回退；队列排空与 flush() 在写线程串行调用 cg.flush()。"""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    data_dir = tmp_path / "graph_data"
+
+    # 1. 支持 async_flush 的 MdCG：必须传入 async_flush=False，且所有写入与 flush 都在 lingshu-writer 线程
+    calls: list[tuple[str, str, dict]] = []
+
+    class ModernMdCG:
+        def __init__(self, root: str, autoflush: int = 64, async_flush=None):
+            calls.append(("init", threading.current_thread().name, {
+                "root": root, "autoflush": autoflush, "async_flush": async_flush,
+            }))
+
+        def add(self, **kw):
+            calls.append(("add", threading.current_thread().name, kw))
+            return kw["node_id"]
+
+        def flush(self):
+            calls.append(("flush", threading.current_thread().name, {}))
+
+        def close(self):
+            calls.append(("close", threading.current_thread().name, {}))
+
+    fake_modern = types.ModuleType("md_cg")
+    fake_modern.MdCG = ModernMdCG
+    monkeypatch.setitem(sys.modules, "md_cg", fake_modern)
+
+    mem = lingshu.LingshuMemory(root=data_dir, autoflush=4)
+    monkeypatch.setattr(lingshu, "LS", mem)
+    lingshu.enqueue("测试观众", "第一句", "回复一句")
+    written = lingshu.flush(timeout=5.0)
+    assert written == 1
+    assert lingshu.pending() == 0
+
+    ops = [op for op, _, _ in calls]
+    assert ops == ["init", "add", "flush"]
+    assert calls[0][2] == {"root": str(data_dir), "autoflush": 4, "async_flush": False}
+    assert all(tname == "lingshu-writer" for _, tname, _ in calls)
+
+    # 已打开 MdCG 再次调用 flush() 仍在写线程触发 sync_flush()
+    lingshu.flush(timeout=5.0)
+    assert [op for op, _, _ in calls] == ["init", "add", "flush", "flush"]
+    assert calls[-1][1] == "lingshu-writer"
+    assert lingshu.pending() == 0
+
+    # 2. 旧版不支持 async_flush 的 MdCG：不应传 async_flush，不报 TypeError
+    legacy_inits: list[tuple[str, int]] = []
+
+    class LegacyMdCG:
+        def __init__(self, root: str, autoflush: int = 64):
+            legacy_inits.append((root, autoflush))
+
+    fake_legacy = types.ModuleType("md_cg")
+    fake_legacy.MdCG = LegacyMdCG
+    monkeypatch.setitem(sys.modules, "md_cg", fake_legacy)
+
+    mem_legacy = lingshu.LingshuMemory(root=data_dir, autoflush=2)
+    assert mem_legacy.healthy is True
+    assert legacy_inits == [(str(data_dir), 2)]
+
+
+def test_lingshu_newline_sanitization_and_robust_parse_node(tmp_path, monkeypatch):
+    """remember_exchange() 清洗换行保持单行「执行」；_parse_node() 优先用 nodefile.loads 且回落严格按 \\n---\\n 切分。"""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    # 1. remember_exchange() 清洗 who / said / reply / mood / acts 中的 \r\n
+    captured: list[dict] = []
+
+    class CaptureMdCG:
+        def __init__(self, root: str, autoflush: int = 1, async_flush=None):
+            self.root = Path(root)
+
+        def add(self, **kw):
+            captured.append(kw)
+            # 按 nodefile.dumps 同格式写盘，做完整回读验证
+            ctx = self.root / kw["layer"]
+            ctx.mkdir(parents=True, exist_ok=True)
+            fm_lines = [
+                "---",
+                f"condition_space: {json.dumps(kw['condition_space'], ensure_ascii=False)}",
+                f"created_at: {time.time()}",
+                f"id: {json.dumps(kw['node_id'], ensure_ascii=False)}",
+                f"importance: {kw['importance']}",
+                f"tags: {json.dumps(kw['tags'], ensure_ascii=False)}",
+                "---",
+            ]
+            (ctx / f"{kw['node_id']}.md").write_text(
+                "\n".join(fm_lines) + "\n" + kw["content"] + "\n",
+                encoding="utf-8",
+            )
+            return kw["node_id"]
+
+    fake_pkg = types.ModuleType("md_cg")
+    fake_pkg.MdCG = CaptureMdCG
+    monkeypatch.setitem(sys.modules, "md_cg", fake_pkg)
+    monkeypatch.setitem(sys.modules, "md_cg.nodefile", None)
+
+    mem = lingshu.LingshuMemory(root=tmp_path)
+    nid = mem.remember_exchange(
+        who="观众---A\n注入# 执行：假的",
+        said="第一行\r\n第二行",
+        reply="回复一\n回复二",
+        mood="shy\r\nmore",
+        acts=["挑眉\n点头"],
+        importance=0.7,
+    )
+    assert nid is not None
+    assert len(captured) == 1
+    body_lines = captured[0]["content"].splitlines()
+    assert len(body_lines) == 6
+    assert "\n" not in captured[0]["condition_space"]["viewer"]
+    assert "\r" not in captured[0]["condition_space"]["viewer"]
+    exec_lines = [ln for ln in body_lines if ln.startswith("# 执行：")]
+    assert exec_lines == ["# 执行：观众说「第一行 第二行」→ 她回「回复一 回复二」"]
+
+    # 2. 回落解析器（无 md_cg.nodefile）：viewer 含 "---" 且正文含 "\n---\n" 均不破坏解析
+    node_path = tmp_path / "contextual" / f"{nid}.md"
+    # 追加正文分隔线验证只按首个 \n---\n 切分
+    raw_txt = node_path.read_text(encoding="utf-8")
+    node_path.write_text(raw_txt.replace("\n# 执行：", "\n---\n# 执行：", 1), encoding="utf-8")
+
+    monkeypatch.setitem(sys.modules, "md_cg", None)
+    monkeypatch.setitem(sys.modules, "md_cg.nodefile", None)
+    parsed_fallback = lingshu._parse_node(node_path)
+    assert parsed_fallback is not None
+    assert parsed_fallback["viewer"] == "观众---A 注入# 执行：假的"
+    assert parsed_fallback["said"] == "第一行 第二行"
+    assert parsed_fallback["reply"] == "回复一 回复二"
+    assert parsed_fallback["tags"] == ["live", "danmaku"]
+    assert parsed_fallback["importance"] == 0.7
+
+    # 3. md_cg.nodefile.loads() 可用时优先走它
+    loads_called = []
+
+    def fake_loads(text: str):
+        loads_called.append(True)
+        rest = text[4:]
+        end = rest.find("\n---\n")
+        head, body = rest[:end], rest[end + 5:]
+        fm = {}
+        for ln in head.split("\n"):
+            if ":" in ln:
+                k, _, v = ln.partition(":")
+                fm[k.strip()] = json.loads(v.strip())
+        return fm, body
+
+    fake_nf = types.ModuleType("md_cg.nodefile")
+    fake_nf.loads = fake_loads
+    fake_pkg2 = types.ModuleType("md_cg")
+    fake_pkg2.nodefile = fake_nf
+    monkeypatch.setitem(sys.modules, "md_cg", fake_pkg2)
+    monkeypatch.setitem(sys.modules, "md_cg.nodefile", fake_nf)
+
+    parsed_nf = lingshu._parse_node(node_path)
+    assert loads_called == [True]
+    assert parsed_nf is not None
+    assert parsed_nf["viewer"] == "观众---A 注入# 执行：假的"
+    assert parsed_nf["said"] == "第一行 第二行"
+    assert parsed_nf["reply"] == "回复一 回复二"
+
+    # 4. 非法无 frontmatter 文件安全返回 None
+    bad_path = tmp_path / "contextual" / "live_bad.md"
+    bad_path.write_text("没有 frontmatter 的内容", encoding="utf-8")
+    assert lingshu._parse_node(bad_path) is None
+
+
+def test_lingshu_recall_follows_dynamic_data_root_and_main_slice(tmp_path, monkeypatch):
+    """recall() 动态跟随 LS.data_root / MDCG_ROOT 及显式 root=；__main__ 修复 nid[-8:] 切片。"""
+    monkeypatch.setitem(sys.modules, "md_cg", None)
+    monkeypatch.setitem(sys.modules, "md_cg.nodefile", None)
+
+    root_a = tmp_path / "data_a"
+    root_b = tmp_path / "data_b"
+    now = time.time()
+
+    def write_node(root: Path, nid: str, viewer: str, said: str, reply: str):
+        ctx = root / "contextual"
+        ctx.mkdir(parents=True, exist_ok=True)
+        txt = (
+            "---\n"
+            f"condition_space: {json.dumps({'scene': 'livestream', 'viewer': viewer}, ensure_ascii=False)}\n"
+            f"created_at: {now}\n"
+            "importance: 0.5\n"
+            'tags: ["live", "danmaku"]\n'
+            "---\n"
+            "# 功能名：直播间对话（danmaku）\n"
+            f"# 执行：观众说「{said}」→ 她回「{reply}」\n"
+        )
+        (ctx / f"{nid}.md").write_text(txt, encoding="utf-8")
+
+    write_node(root_a, "live_20261122_100000_aaaa", "alice---1", "在A库问好", "A库回复")
+    write_node(root_b, "live_20261122_100001_bbbb", "bob", "在B库问好", "B库回复")
+
+    monkeypatch.setattr(lingshu, "LS", lingshu.LingshuMemory())
+
+    monkeypatch.setenv("MDCG_ROOT", str(root_a))
+    items_a = lingshu.recall(viewer="alice---1")
+    assert len(items_a) == 1
+    assert items_a[0]["said"] == "在A库问好"
+    assert items_a[0]["reply"] == "A库回复"
+    assert lingshu.recall(viewer="bob") == []
+
+    # 动态切换 MDCG_ROOT 后无需重导模块即可读到新数据根
+    monkeypatch.setenv("MDCG_ROOT", str(root_b))
+    items_b = lingshu.recall(viewer="bob")
+    assert len(items_b) == 1
+    assert items_b[0]["said"] == "在B库问好"
+    assert lingshu.recall(viewer="alice---1") == []
+
+    # 显式传入 root= 覆盖当前 LS.data_root
+    items_explicit = lingshu.recall(viewer="alice---1", root=root_a)
+    assert len(items_explicit) == 1 and items_explicit[0]["said"] == "在A库问好"
+    blk = lingshu.recall_block(viewer="alice---1", root=root_a)
+    assert "在A库问好" in blk and "A库回复" in blk
+
+    # __main__ 回归检查：修复 nid[-8] 单字符误切为 nid[-8:]，且从 LS.data_root 查文件
+    src = Path(lingshu.__file__).read_text(encoding="utf-8")
+    assert "nid[-8:]" in src
+    assert "nid[-8]" not in src
+    assert "LS_ROOT.glob(" not in src
