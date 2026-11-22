@@ -141,8 +141,8 @@ function startControlServer() {
   const http = require('node:http')
   const srv = http.createServer((req, res) => {
     const url = new URL(req.url || '/', 'http://127.0.0.1')
-    const json = (o) => {
-      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+    const json = (o, status = 200) => {
+      res.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
       res.end(JSON.stringify(o))
     }
       if (url.pathname === '/voice') {

@@ -214,9 +214,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": ok})
         if u.path == "/api/params":
             cap, name = data.get("cap", ""), data.get("name", "")
-            params = data.get("params") or {}
+            params = dict(data.get("params") or {})
             # 保留原 key_ref（前端不传）
-            cur = P.get(cap, name)["params"]
+            raw_opt = ((P.caps().get(cap) or {}).get("options") or {}).get(name) or {}
+            old_key_ref = (raw_opt.get("params") or {}).get("key_ref")
+            if old_key_ref and "key_ref" not in params:
+                params["key_ref"] = old_key_ref
             ok = P.set_params(cap, name, params)
             return self._json({"ok": ok})
         if u.path == "/api/secret":

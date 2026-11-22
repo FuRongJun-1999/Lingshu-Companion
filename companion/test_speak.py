@@ -47,7 +47,7 @@ def test_policy_classification():
 
 
 def test_greet_uses_template_and_is_relevant(book):
-    r = speak(book, "你好呀", actor_name="小花")
+    r = speak(book, "你好呀", actor_name="小花", use_llm=False)
     assert r.source == "template"
     assert "小花" in r.text or "在" in r.text
     assert r.mood == "happy"

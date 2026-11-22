@@ -380,9 +380,10 @@ class BilibiliDanmaku:
         elif cmd == "SUPER_CHAT_MESSAGE":
             d = j.get("data") or {}
             u = d.get("user_info") or {}
+            uid = d.get("uid")
             yield BiliEvent(
                 kind="sc", text=str(d.get("message", "")),
-                actor_id=str(u.get("uname")) if u.get("uname") else None,
+                actor_id=str(uid) if uid else None,
                 actor_name=u.get("uname"), raw=j, ts=now,
             )
 

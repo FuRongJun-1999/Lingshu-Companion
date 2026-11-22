@@ -20,6 +20,7 @@ from __future__ import annotations
 import random
 import string
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -286,48 +287,50 @@ LS = LingshuMemory()
 #: 写入队列。多个线程（主循环 / 8792 网页）都会写同一个 MdCG 实例，
 #: 而 MdCG 不是线程安全的，所以统一交给一个后台线程串行消费。
 _Q: list = []
-_QLock = None
-_Worker = None
+_QLock = threading.Lock()
+_QCond = threading.Condition(_QLock)
+_Worker: threading.Thread | None = None
+_InFlight = 0
 
 
 def enqueue(who: str, said: str, reply: str, **kw) -> None:
     """投递到写入队列，立即返回。直播链路绝不等记忆写完。"""
-    global _QLock, _Worker
+    global _Worker
     try:
-        import threading
-        if _QLock is None:
-            _QLock = threading.Lock()
-        with _QLock:
+        with _QCond:
             _Q.append((who, said, reply, kw))
-        if _Worker is None or not _Worker.is_alive():
-            _Worker = threading.Thread(target=_drain, daemon=True, name="lingshu-writer")
-            _Worker.start()
+            if _Worker is None or not _Worker.is_alive():
+                _Worker = threading.Thread(target=_drain, daemon=True, name="lingshu-writer")
+                _Worker.start()
     except Exception:
         pass
 
 
 def _drain() -> None:
     """后台串行消费。空队列时退出，下次 enqueue 会重新拉起。"""
+    global _Worker, _InFlight
     while True:
-        try:
-            with _QLock:
-                if not _Q:
-                    return
-                who, said, reply, kw = _Q.pop(0)
-        except Exception:
-            return
+        with _QCond:
+            if not _Q:
+                _Worker = None
+                _QCond.notify_all()
+                return
+            who, said, reply, kw = _Q.pop(0)
+            _InFlight += 1
         try:
             LS.remember_exchange(who, said, reply, **kw)
         except Exception:
             pass
+        finally:
+            with _QCond:
+                _InFlight -= 1
+                if not _Q and _InFlight == 0:
+                    _QCond.notify_all()
 
 
 def pending() -> int:
-    try:
-        with _QLock:
-            return len(_Q)
-    except Exception:
-        return 0
+    with _QLock:
+        return len(_Q) + _InFlight
 
 
 def flush(timeout: float = 10.0) -> int:
@@ -336,15 +339,13 @@ def flush(timeout: float = 10.0) -> int:
     后台写线程是 daemon，进程一退就被杀，队列里没写完的就丢了。
     一次性模式（--say）和主循环收尾都要走这里。
     """
-    import time as _t
-    t0 = _t.time()
-    while _t.time() - t0 < timeout:
-        if pending() == 0:
-            # 队列空了，再给 worker 一点时间把最后一条落盘
-            _t.sleep(0.3)
-            if pending() == 0:
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _QCond:
+        while _Q or _InFlight > 0:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
                 break
-        _t.sleep(0.1)
+            _QCond.wait(timeout=rem)
     return LS.written
 
 

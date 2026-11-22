@@ -14,9 +14,18 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+REPO = ROOT.parent
 LOG = ROOT / "_live.log"
 ERR = ROOT / "_live.err"
 PID_FILE = ROOT / "_live.pid"
+
+
+def _find_config() -> Path | None:
+    """优先读仓根 config.local.json（与 README / main.py 一致），兼容旧同级目录。"""
+    for cand in (REPO / "config.local.json", ROOT / "config.local.json"):
+        if cand.exists():
+            return cand
+    return None
 
 
 def stop() -> None:
@@ -36,9 +45,9 @@ def stop() -> None:
 
 def start() -> None:
     import json
-    cfg_path = ROOT / "config.local.json"
+    cfg_path = _find_config()
     room = 0
-    if cfg_path.exists():
+    if cfg_path is not None:
         room = (json.loads(cfg_path.read_text(encoding="utf-8"))
                 .get("bilibili", {}).get("room_id", 0))
     if not room:

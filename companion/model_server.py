@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.parse
 import urllib.request
@@ -24,7 +25,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-STAGE = Path(r"D:\2_ai\_live2d_stage\model")
+
+
+def _stage_dir() -> Path:
+    env = os.environ.get("LIVE2D_MODEL_DIR")
+    if env:
+        return Path(env)
+    for cand in (ROOT.parent / "models", ROOT / "models"):
+        if cand.is_dir():
+            return cand
+    return ROOT.parent / "models"
+
+
+STAGE = _stage_dir()
 BRIDGE = "http://127.0.0.1:8789"
 PORT = 8795
 sys.path.insert(0, str(ROOT))
@@ -34,7 +47,8 @@ def _expressions() -> list[str]:
     """读表情名。cdi3 里没有 Expressions 字段，直接扫 *.exp3.json 文件名。"""
     out = []
     try:
-        for f in sorted((STAGE / "Exp3").glob("*.exp3.json")):
+        exp_dir = STAGE / "Exp3" if (STAGE / "Exp3").is_dir() else STAGE
+        for f in sorted(exp_dir.glob("*.exp3.json")):
             name = f.name[:-len(".exp3.json")]
             if name:
                 out.append(name)

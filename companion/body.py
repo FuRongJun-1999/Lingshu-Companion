@@ -75,6 +75,8 @@ def synth_tts(text: str, out_path: str, *, url: str = DEFAULT_TTS,
               ref: str = DEFAULT_REF, ref_text: str | None = None,
               timeout: float = 120.0) -> bool:
     """调 VoxCPM2 合成 WAV。失败返回 False，不抛。"""
+    if not ref or not Path(ref).is_file():
+        return False
     try:
         body = json.dumps({
             "model": "voxcpm2", "voice": "default", "response_format": "wav",
@@ -207,9 +209,19 @@ class Body:
         self.last_synth_ms = int((time.time() - t0) * 1000)
         if not ok:
             self.fail_streak += 1
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
             return False
         self.fail_streak = 0
+        prev_wav = self.last_wav
         self.last_wav = path
+        if prev_wav and prev_wav != path:
+            try:
+                os.unlink(prev_wav)
+            except OSError:
+                pass
 
         # 播放线程：记录真正开始出声的时刻，供包络对齐
         import threading

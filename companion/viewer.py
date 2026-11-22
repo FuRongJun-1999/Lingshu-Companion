@@ -26,7 +26,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
+REPO = ROOT.parent
+
+
+def _default_data() -> Path:
+    for cand in (REPO / "data", ROOT / "data"):
+        if cand.is_dir():
+            return cand
+    return REPO / "data"
+
+
+DATA = _default_data()
 
 BLOCK_RE = re.compile(
     r"<!-- id:([0-9a-f]{12}) -->\n## (\d{2}:\d{2}:\d{2}) · (.*?)(?: · (.*?))?\n(.*?)(?=\n<!-- id:|\Z)",
@@ -353,6 +363,8 @@ class Handler(BaseHTTPRequestHandler):
                     actor_id='local:owner', actor_name='主人', kind='chat', text=text)
                 r = d['speak'](d['book'], text, kind='chat', actor_name='主人',
                                actor_id='local:owner', idle_pool=d['pool'])
+                if r.text is None:
+                    return self._json({'ok': False, 'error': '裁决过滤，选择沉默'})
                 d['store'].record_response(iid, response=r.text, acts=r.acts,
                                            mood=r.mood, latency_ms=0)
                 d['body'].speak(r.text, r.acts, expr=r.expr, motion=r.motion)
@@ -395,9 +407,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    global DATA
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8792)
+    ap.add_argument("--data", help="数据目录（默认优先仓根 data/）")
     args = ap.parse_args()
+    if args.data:
+        DATA = Path(args.data)
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"对话记录页面: http://127.0.0.1:{args.port}", flush=True)
     srv.serve_forever()
