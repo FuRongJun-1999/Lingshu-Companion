@@ -16,13 +16,32 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-PET = Path(r"D:\2_ai\desktop_pet")
-APP = Path(r"D:\2_ai\lingshu_companion")
-ELECTRON = Path(r"D:\2_ai\_ext\airi\node_modules\.pnpm\electron@43.8.4_supports-color@10.2.2\node_modules\electron\dist\electron.exe")
+APP = Path(__file__).resolve().parent
+REPO = APP.parent
+PET = Path(os.environ.get("COMPANION_PET_DIR") or (REPO / "pet"))
+BRIDGE_DIR = Path(os.environ.get("COMPANION_BRIDGE_DIR") or (REPO / "bridge"))
+
+
+def _find_electron() -> Path | None:
+    env = os.environ.get("ELECTRON_BIN")
+    if env and Path(env).exists():
+        return Path(env)
+    exe = "electron.exe" if sys.platform == "win32" else "electron"
+    cmd = "electron.cmd" if sys.platform == "win32" else "electron"
+    for cand in (
+        PET / "node_modules" / "electron" / "dist" / exe,
+        PET / "node_modules" / ".bin" / cmd,
+    ):
+        if cand.exists():
+            return cand
+    found = shutil.which("electron")
+    return Path(found) if found else None
 
 PORTS = {8789: "桥", 8770: "模型服务", 8792: "对话页面", 8791: "桌宠控制",
          8793: "服务配置", 8795: "模型控制", 8010: "TTS"}
@@ -75,14 +94,17 @@ def main() -> int:
 
     if listening(8789):
         print("  - 桥 8789 已在跑，跳过")
+    elif (BRIDGE_DIR / "bridge-server.mjs").exists():
+        spawn(["node", "bridge-server.mjs"], BRIDGE_DIR, "桥 8789")
     else:
-        spawn(["node", "bridge-server.mjs"],
-              Path(r"D:\2_ai\_ext\airi\packages\plugin-airi-bridge"), "桥 8789")
+        print(f"  ✗ 找不到桥服务 {BRIDGE_DIR / 'bridge-server.mjs'}（可设置 COMPANION_BRIDGE_DIR）")
 
     if listening(8770):
         print("  - 模型服务 8770 已在跑，跳过")
-    else:
+    elif (PET / "serve.py").exists():
         spawn([sys.executable, "serve.py"], PET, "模型服务 8770")
+    else:
+        print(f"  ✗ 找不到模型服务 {PET / 'serve.py'}（可设置 COMPANION_PET_DIR）")
 
     # 等模型服务起来，桌宠才能加载
     import time
@@ -94,10 +116,11 @@ def main() -> int:
     if listening(8791):
         print("  - 桌宠已在跑，跳过")
     else:
-        if ELECTRON.exists():
-            spawn([str(ELECTRON), "."], PET, "桌宠")
+        electron = _find_electron()
+        if electron:
+            spawn([str(electron), "."], PET, "桌宠")
         else:
-            print("  ✗ 找不到 electron.exe")
+            print("  ✗ 找不到 electron（请在 pet/ 执行 npm install，或设置 ELECTRON_BIN）")
 
     for _ in range(30):
         if listening(8791):

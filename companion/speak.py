@@ -273,24 +273,26 @@ def speak(
                 print("  [llm] 异常:", str(e)[:80])
 
             if llm_text:
-                chosen_llm, log_llm = V.pick(
-                    [V.Candidate(text=llm_text, source="llm")],
-                    stimulus, recent, pkind=pkind,
-                )
-                if chosen_llm is not None:
-                    clean, mks = parse_marks(_trim_lines(chosen_llm.text))
-                    kinds = split_by_kind(mks)
-                    acts = list(kinds["pose"]) + acts_for_expr(kinds["expr"])
-                    return Reply(
-                        clean or chosen_llm.text,
-                        acts or _pose_dicts(ACTS.get(pkind, ["挑眉"])),
-                        MOOD.get(pkind, "neutral"),
-                        "llm",
-                        len(log_llm),
-                        pkind,
-                        expr=kinds["expr"],
-                        motion=kinds["motion"],
+                clean_raw, mks = parse_marks(llm_text)
+                candidate_text = _trim_lines(clean_raw) if clean_raw else ""
+                if candidate_text:
+                    chosen_llm, log_llm = V.pick(
+                        [V.Candidate(text=candidate_text, source="llm")],
+                        stimulus, recent, pkind=pkind,
                     )
+                    if chosen_llm is not None:
+                        kinds = split_by_kind(mks)
+                        acts = list(kinds["pose"]) + acts_for_expr(kinds["expr"])
+                        return Reply(
+                            chosen_llm.text,
+                            acts or _pose_dicts(ACTS.get(pkind, ["挑眉"])),
+                            MOOD.get(pkind, "neutral"),
+                            "llm",
+                            len(log_llm),
+                            pkind,
+                            expr=kinds["expr"],
+                            motion=kinds["motion"],
+                        )
 
         # ② 模板兜底
         tpls = TEMPLATES.get(pkind) or TEMPLATES["misc"]

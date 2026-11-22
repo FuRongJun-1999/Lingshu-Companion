@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import sys
 import urllib.parse
 import urllib.request
@@ -24,7 +26,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-STAGE = Path(r"D:\2_ai\_live2d_stage\model")
+
+
+def _stage_dir() -> Path:
+    env = os.environ.get("LIVE2D_MODEL_DIR")
+    if env:
+        return Path(env)
+    for cand in (ROOT.parent / "models", ROOT / "models"):
+        if cand.is_dir():
+            return cand
+    return ROOT.parent / "models"
+
+
+STAGE = _stage_dir()
 BRIDGE = "http://127.0.0.1:8789"
 PORT = 8795
 sys.path.insert(0, str(ROOT))
@@ -34,7 +48,8 @@ def _expressions() -> list[str]:
     """读表情名。cdi3 里没有 Expressions 字段，直接扫 *.exp3.json 文件名。"""
     out = []
     try:
-        for f in sorted((STAGE / "Exp3").glob("*.exp3.json")):
+        exp_dir = STAGE / "Exp3" if (STAGE / "Exp3").is_dir() else STAGE
+        for f in sorted(exp_dir.glob("*.exp3.json")):
             name = f.name[:-len(".exp3.json")]
             if name:
                 out.append(name)
@@ -54,12 +69,13 @@ def _poses() -> dict[str, dict]:
 
 def _get(url: str, timeout: float = 3.0) -> str:
     try:
-        return urllib.request.urlopen(url, timeout=timeout).read().decode("utf-8", "replace")
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
     except Exception as e:
-        return '{"error":"' + str(e)[:60] + '"}'
+        return json.dumps({"error": str(e)[:60]}, ensure_ascii=False)
 
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>灵枢伴侣 · 模型控制</title>
@@ -253,11 +269,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._text(_get(BRIDGE + f"/pose?params={p}&ms=3000"))
         if u.path == "/api/pose-params":
             p = (q.get("p") or ["{}"])[0]
-            ms = (q.get("ms") or ["3000"])[0]
-            return self._text(_get(BRIDGE + "/pose?params=" + urllib.parse.quote(p) + "&ms=" + ms))
+            try:
+                ms_val = float((q.get("ms") or ["3000"])[0])
+                if not math.isfinite(ms_val):
+                    raise ValueError
+                ms = max(0, int(ms_val))
+            except ValueError:
+                return self._json({"error": "invalid ms"}, 400)
+            return self._text(_get(f"{BRIDGE}/pose?params={urllib.parse.quote(p)}&ms={ms}"))
         if u.path == "/api/mouth":
-            v = (q.get("value") or ["0"])[0]
-            return self._text(_get(BRIDGE + "/mouth?value=" + v))
+            try:
+                v_val = float((q.get("value") or ["0"])[0])
+                if not math.isfinite(v_val):
+                    raise ValueError
+                v = max(0, min(100, int(round(v_val))))
+            except ValueError:
+                return self._json({"error": "invalid value"}, 400)
+            return self._text(_get(f"{BRIDGE}/mouth?value={v}"))
         if u.path == "/api/reset-pose":
             zeros = {k: 0 for k in
                      ["ParamAngleX", "ParamAngleY", "ParamAngleZ", "ParamBodyAngleX", "ParamBodyAngleZ",

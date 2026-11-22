@@ -109,11 +109,18 @@ def _cache_path() -> Path:
 def _load_cache(room_id: int) -> dict | None:
     """token 有效期约 1 小时；命中则免去一次 getDanmuInfo（该接口限流严格）。"""
     try:
+        target = int(room_id)
+        if target <= 0:
+            return None
         p = _cache_path()
         if not p.exists():
             return None
         d = json.loads(p.read_text(encoding="utf-8"))
-        if int(d.get("room_id", 0)) != int(room_id):
+        matched_ids = {int(d.get("room_id") or 0)}
+        if d.get("input_room_id") is not None:
+            matched_ids.add(int(d.get("input_room_id") or 0))
+        matched_ids.discard(0)
+        if target not in matched_ids:
             return None
         if time.time() - float(d.get("ts", 0)) > 3000:      # 50 分钟
             return None
@@ -124,10 +131,19 @@ def _load_cache(room_id: int) -> dict | None:
         return None
 
 
-def _save_cache(room_id: int, token: str, hosts: list, mixin: str, buvid3: str) -> None:
+def _save_cache(
+    room_id: int,
+    token: str,
+    hosts: list,
+    mixin: str,
+    buvid3: str,
+    input_room_id: int | None = None,
+) -> None:
     try:
         _cache_path().write_text(json.dumps({
-            "room_id": int(room_id), "token": token, "hosts": hosts,
+            "room_id": int(room_id),
+            "input_room_id": int(input_room_id) if input_room_id is not None else int(room_id),
+            "token": token, "hosts": hosts,
             "mixin": mixin, "buvid3": buvid3, "ts": time.time(),
         }, ensure_ascii=False), encoding="utf-8")
     except Exception:
@@ -277,7 +293,10 @@ class BilibiliDanmaku:
         self.token = ((dm.get("data") or {}).get("token")) or ""
         self.hosts = ((dm.get("data") or {}).get("host_list")) or []
         if self.token and self.hosts:
-            _save_cache(self.room_id, self.token, self.hosts, self.mixin, self.buvid3)
+            _save_cache(
+                self.room_id, self.token, self.hosts, self.mixin, self.buvid3,
+                input_room_id=self.input_room_id,
+            )
         return self.room_id
 
     # 兼容旧调用
@@ -380,9 +399,10 @@ class BilibiliDanmaku:
         elif cmd == "SUPER_CHAT_MESSAGE":
             d = j.get("data") or {}
             u = d.get("user_info") or {}
+            uid = d.get("uid")
             yield BiliEvent(
                 kind="sc", text=str(d.get("message", "")),
-                actor_id=str(u.get("uname")) if u.get("uname") else None,
+                actor_id=str(uid) if uid else None,
                 actor_name=u.get("uname"), raw=j, ts=now,
             )
 

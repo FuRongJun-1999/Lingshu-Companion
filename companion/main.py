@@ -189,6 +189,7 @@ def handle(store: MdStore, ev: Stimulus, replier, body: Body | None = None) -> N
     )
     print(f"  [落库] id={iid} kind={ev.kind}")
 
+    r = None
     if replier is scripted_reply:
         text, acts, mood, r = scripted_reply(store, ev, _RECENT)
         if text is None:
@@ -205,18 +206,18 @@ def handle(store: MdStore, ev: Stimulus, replier, body: Body | None = None) -> N
         ex = getattr(r, "expr", []) or []
         mo = getattr(r, "motion", []) or []
         res = body.speak(text, acts, expr=ex, motion=mo)
-
-        # 写灵枢情景层（异步，失败不影响直播）
-        # 冷场自语不写：一场几十条会把情景层刷满
-        if ev.kind != "idle":
-            try:
-                from lingshu import enqueue
-                enqueue(ev.actor_name or "未知", ev.text, text,
-                        kind=ev.kind, mood=mood, acts=acts,
-                        importance=0.55 if ev.kind == "danmaku" else 0.45)
-            except Exception as _e:
-                print(f"  [灵枢] 投递失败: {type(_e).__name__}: {_e}")
         print(f"  [身体] 动作={'ok' if res['acted'] else '跳过'}  发声={'ok' if res['spoke'] else '失败'}")
+
+    # 写灵枢情景层（异步，失败不影响直播；不依赖 --voice 开关）
+    # 冷场自语不写：一场几十条会把情景层刷满
+    if ev.kind != "idle":
+        try:
+            from lingshu import enqueue
+            enqueue(ev.actor_name or "未知", ev.text, text,
+                    kind=ev.kind, mood=mood, acts=acts,
+                    importance=0.55 if ev.kind == "danmaku" else 0.45)
+        except Exception as _e:
+            print(f"  [灵枢] 投递失败: {type(_e).__name__}: {_e}")
     _RECENT.append(text)
     del _RECENT[:-10]
 
@@ -313,6 +314,11 @@ def main(argv: list[str] | None = None) -> int:
         wd.stop()
         if hw:
             hw.stop()
+        try:
+            from lingshu import flush as _ls_flush
+            _ls_flush(timeout=5)
+        except Exception:
+            pass
         print("统计:", store.stats(), "  冷场触发 " + str(wd.fires) + " 次")
         store.close()
     return 0
