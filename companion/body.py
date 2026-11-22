@@ -67,7 +67,8 @@ _REF_CACHE: dict[str, str] = {}
 def _ref_b64(path: str) -> str:
     import base64
     if path not in _REF_CACHE:
-        _REF_CACHE[path] = base64.b64encode(open(path, "rb").read()).decode()
+        with open(path, "rb") as f:
+            _REF_CACHE[path] = base64.b64encode(f.read()).decode()
     return _REF_CACHE[path]
 
 
@@ -223,6 +224,9 @@ class Body:
             except OSError:
                 pass
 
+        # 先预计算包络，再起播放线程，避免首段口型被解码耗时拖后
+        env = self._envelope(path)
+
         # 播放线程：记录真正开始出声的时刻，供包络对齐
         import threading
         started = []
@@ -241,7 +245,7 @@ class Body:
         while not started and time.perf_counter() - t_wait < 1.0:
             time.sleep(0.002)
         if started:
-            self._push_mouth(path, started[0])
+            self._push_mouth(env, started[0])
         done.wait(timeout=60)
         # 说完立刻闭嘴
         self._get('/mouth?value=0', timeout=0.5)
@@ -284,19 +288,26 @@ class Body:
             print('  [口型] 包络失败:', str(e)[:80])
         return out
 
-    def _push_mouth(self, wav_path: str, base_ts: float) -> None:
+    def _push_mouth(self, env_or_path: list | str | os.PathLike, base_ts: float) -> None:
         """按音频时间轴推包络，保证和实际出声对齐。
 
         base_ts 是播放线程开始的时间戳（perf_counter）。
-        每一帧都按「该帧应有的时刻」睡到点再发，误差不累积。
+        每一帧都按「该帧应有的时刻」睡到点再发，误差不累积；
+        若单帧已落后超过 50ms 则跳过（尾帧除外），避免网络卡顿后连发旧帧。
         """
-        env = self._envelope(wav_path)
+        if isinstance(env_or_path, (str, os.PathLike)):
+            env = self._envelope(str(env_or_path))
+        else:
+            env = list(env_or_path or [])
         if not env:
             return
-        for rel_t, v in env:
+        last_idx = len(env) - 1
+        for i, (rel_t, v) in enumerate(env):
             target = base_ts + rel_t
             now = time.perf_counter()
             delay = target - now
+            if delay < -0.05 and i < last_idx:
+                continue
             if delay > 0:
                 time.sleep(delay)
             self._get('/mouth?value=%d' % int(v * 100), timeout=0.3)

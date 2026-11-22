@@ -27,7 +27,7 @@ from providers import P  # noqa: E402
 
 PORT = 8793
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>灵枢伴侣 · 服务配置</title>

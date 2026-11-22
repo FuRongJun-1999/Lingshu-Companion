@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import urllib.parse
@@ -68,12 +69,13 @@ def _poses() -> dict[str, dict]:
 
 def _get(url: str, timeout: float = 3.0) -> str:
     try:
-        return urllib.request.urlopen(url, timeout=timeout).read().decode("utf-8", "replace")
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
     except Exception as e:
-        return '{"error":"' + str(e)[:60] + '"}'
+        return json.dumps({"error": str(e)[:60]}, ensure_ascii=False)
 
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>灵枢伴侣 · 模型控制</title>
@@ -267,11 +269,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._text(_get(BRIDGE + f"/pose?params={p}&ms=3000"))
         if u.path == "/api/pose-params":
             p = (q.get("p") or ["{}"])[0]
-            ms = (q.get("ms") or ["3000"])[0]
-            return self._text(_get(BRIDGE + "/pose?params=" + urllib.parse.quote(p) + "&ms=" + ms))
+            try:
+                ms_val = float((q.get("ms") or ["3000"])[0])
+                if not math.isfinite(ms_val):
+                    raise ValueError
+                ms = max(0, int(ms_val))
+            except ValueError:
+                return self._json({"error": "invalid ms"}, 400)
+            return self._text(_get(f"{BRIDGE}/pose?params={urllib.parse.quote(p)}&ms={ms}"))
         if u.path == "/api/mouth":
-            v = (q.get("value") or ["0"])[0]
-            return self._text(_get(BRIDGE + "/mouth?value=" + v))
+            try:
+                v_val = float((q.get("value") or ["0"])[0])
+                if not math.isfinite(v_val):
+                    raise ValueError
+                v = max(0, min(100, int(round(v_val))))
+            except ValueError:
+                return self._json({"error": "invalid value"}, 400)
+            return self._text(_get(f"{BRIDGE}/mouth?value={v}"))
         if u.path == "/api/reset-pose":
             zeros = {k: 0 for k in
                      ["ParamAngleX", "ParamAngleY", "ParamAngleZ", "ParamBodyAngleX", "ParamBodyAngleZ",
