@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -177,12 +178,38 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
+def _file_sig(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """尽量通过临时文件 + os.replace 原子落盘，减少跨进程读到半写 JSON 的概率。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            path.write_text(text, encoding="utf-8")
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+
 def _ensure() -> None:
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     if not SERVICES.exists():
-        SERVICES.write_text(json.dumps(DEFAULTS, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write(SERVICES, json.dumps(DEFAULTS, ensure_ascii=False, indent=2))
     if not SECRETS.exists():
-        SECRETS.write_text("{}", encoding="utf-8")
+        _atomic_write(SECRETS, "{}")
 
 
 class Registry:
@@ -190,25 +217,62 @@ class Registry:
 
     def __init__(self) -> None:
         _ensure()
+        self._lock = threading.RLock()
         self._data: dict[str, Any] = {}
+        self._loaded_path: Path | None = None
+        self._loaded_sig: tuple[int, int] | None = None
         self.reload()
 
-    def reload(self) -> None:
-        try:
-            self._data = json.loads(SERVICES.read_text(encoding="utf-8"))
-        except Exception:
-            self._data = json.loads(json.dumps(DEFAULTS))
-        # 补齐新增能力（老配置升级）
-        caps = self._data.setdefault("capabilities", {})
-        for name, spec in DEFAULTS["capabilities"].items():
-            caps.setdefault(name, spec)
+    def reload(self) -> bool:
+        """从磁盘加载 services.json；文件正被写入或损坏时保留上次有效内存配置。"""
+        with self._lock:
+            sig = _file_sig(SERVICES)
+            loaded: dict[str, Any] | None = None
+            if sig is not None:
+                try:
+                    raw = json.loads(SERVICES.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        loaded = raw
+                except Exception:
+                    loaded = None
+
+            if loaded is None:
+                if self._data:
+                    return False
+                loaded = json.loads(json.dumps(DEFAULTS))
+                sig = None
+
+            # 补齐新增能力（老配置升级；深拷贝避免污染 DEFAULTS）
+            caps = loaded.setdefault("capabilities", {})
+            if not isinstance(caps, dict):
+                caps = {}
+                loaded["capabilities"] = caps
+            for name, spec in DEFAULTS["capabilities"].items():
+                caps.setdefault(name, json.loads(json.dumps(spec)))
+
+            self._data = loaded
+            self._loaded_path = SERVICES
+            self._loaded_sig = sig
+            return True
+
+    def _maybe_reload(self) -> None:
+        """检测 services.json 的路径 / mtime_ns / size 变化并自动热加载。"""
+        with self._lock:
+            sig = _file_sig(SERVICES)
+            if self._loaded_path != SERVICES or (sig is not None and sig != self._loaded_sig):
+                self.reload()
 
     def save(self) -> None:
-        SERVICES.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            _atomic_write(SERVICES, json.dumps(self._data, ensure_ascii=False, indent=2))
+            self._loaded_path = SERVICES
+            self._loaded_sig = _file_sig(SERVICES)
 
     # ── 读 ──
     def caps(self) -> dict[str, Any]:
-        return self._data.get("capabilities", {})
+        with self._lock:
+            self._maybe_reload()
+            return self._data.get("capabilities", {})
 
     def current_name(self, cap: str) -> str:
         c = self.caps().get(cap) or {}
@@ -238,23 +302,27 @@ class Registry:
 
     # ── 写 ──
     def set_current(self, cap: str, name: str) -> bool:
-        c = self.caps().get(cap)
-        if not c or name not in (c.get("options") or {}):
-            return False
-        c["current"] = name
-        self.save()
-        return True
+        with self._lock:
+            self._maybe_reload()
+            c = self._data.get("capabilities", {}).get(cap)
+            if not c or name not in (c.get("options") or {}):
+                return False
+            c["current"] = name
+            self.save()
+            return True
 
     def set_params(self, cap: str, name: str, params: dict) -> bool:
-        c = self.caps().get(cap)
-        if not c:
-            return False
-        opt = (c.get("options") or {}).get(name)
-        if not opt:
-            return False
-        opt["params"] = dict(params)
-        self.save()
-        return True
+        with self._lock:
+            self._maybe_reload()
+            c = self._data.get("capabilities", {}).get(cap)
+            if not c:
+                return False
+            opt = (c.get("options") or {}).get(name)
+            if not opt:
+                return False
+            opt["params"] = dict(params)
+            self.save()
+            return True
 
     # ── 密钥 ──
     def secrets(self) -> dict[str, str]:
@@ -271,9 +339,10 @@ class Registry:
         return os.environ.get(ref.upper(), "")
 
     def set_secret(self, ref: str, value: str) -> None:
-        s = self.secrets()
-        s[ref] = value
-        SECRETS.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            s = self.secrets()
+            s[ref] = value
+            _atomic_write(SECRETS, json.dumps(s, ensure_ascii=False, indent=2))
 
     # ── 探测 ──
     def test(self, cap: str, name: str | None = None) -> dict:

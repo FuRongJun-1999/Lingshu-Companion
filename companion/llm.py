@@ -70,6 +70,22 @@ def available() -> bool:
     return bool(_load_key())
 
 
+def _thinking_payload(value) -> dict | None:
+    """将显式配置的 thinking 参数规范化为请求体字段；未配置返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value) if value else None
+    if isinstance(value, bool):
+        return {"type": "enabled" if value else "disabled"}
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        return {"type": s}
+    return None
+
+
 def chat(
     messages: list[dict],
     *,
@@ -77,7 +93,7 @@ def chat(
     temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: float = 20.0,
-    thinking: bool = False,
+    thinking: bool | str | dict | None = None,
 ) -> str | None:
     """单轮补全。失败返回 None。"""
     cfg = _cfg()
@@ -110,8 +126,12 @@ def chat(
             "max_tokens": max_tokens,
             "stream": False,
         }
-        if not thinking:
-            body["thinking"] = {"type": "disabled"}
+        # 仅在 provider params 或调用方显式配置时才附带非标准 thinking 字段，
+        # 避免严格 OpenAI 兼容网关返回 HTTP 400（与 providers.py:test() 保持一致）。
+        thinking_cfg = p.get("thinking") if thinking is None else thinking
+        thinking_payload = _thinking_payload(thinking_cfg)
+        if thinking_payload is not None:
+            body["thinking"] = thinking_payload
         url = base + "/chat/completions"
         headers = {"Content-Type": "application/json", "Authorization": "Bearer " + key}
         pick = lambda d: (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()

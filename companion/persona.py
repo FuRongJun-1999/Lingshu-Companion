@@ -141,11 +141,19 @@ def build_messages(
     if hint:
         sys_parts.append("## 当前\n" + hint)
 
-    msgs = [{"role": "system", "content": "\n\n".join(sys_parts)}]
-
-    for r in (recent or [])[-4:]:
-        msgs.append({"role": "assistant", "content": r})
+    # 将最近台词折叠进 system，而不是在 system 后连续堆叠多条 assistant 消息，
+    # 避免严格校验 user/assistant 交替角色的网关直接返回 HTTP 400。
+    recent_lines = [
+        " ".join(str(r).splitlines()).strip()
+        for r in (recent or [])
+        if r and str(r).strip()
+    ][-4:]
+    if recent_lines:
+        bullets = "\n".join(f"- {line}" for line in recent_lines)
+        sys_parts.append("## 刚才说过（避免重复）\n" + bullets)
 
     who = actor_name or "观众"
-    msgs.append({"role": "user", "content": f"{who}：{stimulus}"})
-    return msgs
+    return [
+        {"role": "system", "content": "\n\n".join(sys_parts)},
+        {"role": "user", "content": f"{who}：{stimulus}"},
+    ]

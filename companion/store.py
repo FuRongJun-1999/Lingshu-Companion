@@ -32,6 +32,44 @@ from typing import Iterable
 
 BLOCK_RE = re.compile(r"<!-- id:([0-9a-f]{12}) -->.*?\n(.*?)(?=\n<!-- id:|\Z)", re.S)
 
+_LINEBREAK_RE = re.compile(r"[\r\n\x0b\x0c\x85\u2028\u2029]+")
+_LINEBREAK_SINGLE_RE = re.compile(r"\r\n|[\r\x0b\x0c\x85\u2028\u2029]")
+_META_LINE_RE = re.compile(r"- (?=(?:类型|状态|动作|情绪|延迟|ID|首次|最近|互动|亲密度)：)")
+
+
+def _escape_md_markers(text: str) -> str:
+    """转义会干扰 FORMAT.md / viewer.py 正则边界的结构标记（幂等）。"""
+    text = text.replace("<!--", r"<\!--")
+    text = text.replace("**她**：", r"\*\*她\*\*：")
+    text = text.replace("**观众**：", r"\*\*观众\*\*：")
+    text = _META_LINE_RE.sub("－ ", text)
+    return text
+
+
+def _sanitize_inline(value: str | None, *, escape_sep: bool = False) -> str:
+    """清洗单行标题/关系元数据字段：压平换行、避免破坏 ` · ` 分隔与结构标记。"""
+    if value is None:
+        return ""
+    s = _LINEBREAK_RE.sub(" ", str(value)).strip()
+    if escape_sep:
+        s = s.replace("·", "・")
+    return _escape_md_markers(s)
+
+
+def _sanitize_kind(kind: str | None) -> str:
+    s = re.sub(r"\s+", "_", _sanitize_inline(kind, escape_sep=True))
+    return s or "danmaku"
+
+
+def _sanitize_body(value: str | None) -> str:
+    """清洗互动正文：合并空行避免截断 `\\n\\n` 正则，并转义结构标记（幂等）。"""
+    if value is None:
+        return ""
+    s = _LINEBREAK_SINGLE_RE.sub("\n", str(value))
+    lines = [ln.rstrip() for ln in s.split("\n") if ln.strip()]
+    s = "\n".join(lines).strip()
+    return _escape_md_markers(s)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc).astimezone()
@@ -131,28 +169,35 @@ class MdStore:
         mood: str | None = None,
         latency_ms: int | None = None,
     ) -> str:
-        who = actor_name or "（未知）"
-        tail = f" · {actor_id}" if actor_id else ""
+        who = _sanitize_inline(actor_name, escape_sep=True) or "（未知）"
+        aid = _sanitize_inline(actor_id, escape_sep=True)
+        tail = f" · {aid}" if aid else ""
+        kind_s = _sanitize_kind(kind)
+        stim_body = _sanitize_body(stimulus) or "（空）"
+        resp_body = _sanitize_body(response) if response is not None else ""
+        has_resp = bool(resp_body)
         parts = [
             f"<!-- id:{iid} -->",
             f"## {dt:%H:%M:%S} · {who}{tail}",
             "",
-            f"- 类型：{kind}",
-            f"- 状态：{'已回应' if response else '待回应'}",
+            f"- 类型：{kind_s}",
+            f"- 状态：{'已回应' if has_resp else '待回应'}",
             "",
             "**观众**：",
             "",
-            stimulus.strip() or "（空）",
+            stim_body,
             "",
         ]
-        if response:
+        if has_resp:
+            acts_s = _sanitize_inline(_fmt_acts(acts))
+            mood_s = _sanitize_inline(mood) or "未标注"
             parts += [
                 "**她**：",
                 "",
-                response.strip(),
+                resp_body,
                 "",
-                f"- 动作：{_fmt_acts(acts)}",
-                f"- 情绪：{mood or '未标注'}",
+                f"- 动作：{acts_s}",
+                f"- 情绪：{mood_s}",
                 f"- 延迟：{latency_ms} ms" if latency_ms is not None else "- 延迟：未记录",
                 "",
             ]
@@ -174,12 +219,13 @@ class MdStore:
         dt = _now()
         iid = self._new_id()
         block = self._render_block(iid, dt, actor_id, actor_name, kind, text)
+        clean_aid = _sanitize_inline(actor_id, escape_sep=True)
         with self._lock:
             path = self._day_path(dt)
             body = self._ensure_day_header(path, dt)
             _atomic_write(path, body + block)
-            if actor_id:
-                self._touch_relation(actor_id, actor_name, dt, kind, text)
+            if clean_aid:
+                self._touch_relation(clean_aid, actor_name, dt, kind, text)
         return iid
 
     def record_response(
@@ -224,26 +270,30 @@ class MdStore:
             return False
 
     def _touch_relation(self, actor_id: str, actor_name: str | None, dt: datetime, kind: str, text: str) -> None:
-        safe = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff-]", "_", actor_id)[:60]
+        clean_aid = _sanitize_inline(actor_id, escape_sep=True)
+        safe = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff-]", "_", clean_aid)[:60] or "unknown"
+        title = _sanitize_inline(actor_name, escape_sep=True) or clean_aid or "（未知）"
+        kind_s = _sanitize_kind(kind)
+        summary = _sanitize_inline(text)[:60]
         path = self.rel_dir / f"{safe}.md"
         if not path.exists():
             _atomic_write(path, (
-                f"# {actor_name or actor_id}\n\n"
-                f"- ID：{actor_id}\n"
+                f"# {title}\n\n"
+                f"- ID：{clean_aid}\n"
                 f"- 首次：{dt:%Y-%m-%d %H:%M}\n"
                 f"- 最近：{dt:%Y-%m-%d %H:%M}\n"
                 f"- 互动：1 次\n"
                 f"- 亲密度：0.05\n\n"
                 f"## 最近互动\n\n"
-                f"- {dt:%Y-%m-%d %H:%M} [{kind}] {text.strip()[:60]}\n"
+                f"- {dt:%Y-%m-%d %H:%M} [{kind_s}] {summary}\n"
             ))
             return
         body = path.read_text(encoding="utf-8")
-        body = re.sub(r"- 最近：.*", f"- 最近：{dt:%Y-%m-%d %H:%M}", body)
-        body = re.sub(r"- 互动：(\d+) 次", lambda m: f"- 互动：{int(m.group(1)) + 1} 次", body)
-        body = re.sub(r"- 亲密度：([0-9.]+)", lambda m: f"- 亲密度：{min(1.0, float(m.group(1)) + 0.01):.2f}", body)
-        entry = f"- {dt:%Y-%m-%d %H:%M} [{kind}] {text.strip()[:60]}\n"
-        if "## 最近互动" in body:
+        body = re.sub(r"^- 最近：.*$", f"- 最近：{dt:%Y-%m-%d %H:%M}", body, count=1, flags=re.M)
+        body = re.sub(r"^- 互动：(\d+) 次$", lambda m: f"- 互动：{int(m.group(1)) + 1} 次", body, count=1, flags=re.M)
+        body = re.sub(r"^- 亲密度：([0-9.]+)$", lambda m: f"- 亲密度：{min(1.0, float(m.group(1)) + 0.01):.2f}", body, count=1, flags=re.M)
+        entry = f"- {dt:%Y-%m-%d %H:%M} [{kind_s}] {summary}\n"
+        if re.search(r"^## 最近互动$", body, re.M):
             body = body.rstrip("\n") + "\n" + entry
         else:
             body += "\n## 最近互动\n\n" + entry
@@ -253,11 +303,12 @@ class MdStore:
 
     def recent(self, limit: int = 20, actor_id: str | None = None) -> list[dict]:
         out: list[dict] = []
+        target_aid = _sanitize_inline(actor_id, escape_sep=True) if actor_id else None
         for path in sorted(self.inter_dir.glob("*.md"), reverse=True):
             text = path.read_text(encoding="utf-8")
             for m in re.finditer(r"<!-- id:([0-9a-f]{12}) -->\n## (\d{2}:\d{2}:\d{2}) · (.*?)(?: · (.*?))?\n(.*?)(?=\n<!-- id:|\Z)", text, re.S):
                 iid, hh, who, aid, rest = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
-                if actor_id and aid != actor_id:
+                if target_aid and aid != target_aid:
                     continue
                 resp = re.search(r"\*\*她\*\*：\n\n(.*?)\n\n", rest, re.S)
                 stim = re.search(r"\*\*观众\*\*：\n\n(.*?)\n\n", rest, re.S)
