@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import collections
 import queue
 import sys
 import time
@@ -24,6 +25,25 @@ import numpy as np
 
 TARGET_SR = 16000          # whisper 要 16k
 CHUNK = 0.05               # 每块 50ms
+PRE_BUFFER_CHUNKS = 8      # 触发前预缓冲 ~0.4s（8 * 50ms），避免吃掉首字
+CALIB_CHUNKS = 8           # 启动前 ~0.4s 环境底噪采样（同步写入预缓冲，不丢弃音频）
+MIN_THRESH = 0.0015        # 最低人声触发阈值
+NOISE_MULTIPLIER = 2.2     # 相对噪底倍率
+MAX_NOISE_FLOOR = 0.004    # 启动瞬间即开口时噪底上限，避免阈值被拉爆
+
+
+def _estimate_noise_floor(samples: list[float]) -> float:
+    """用低分位静默基线估算环境噪底，避免瞬时说话声或点击声污染阈值。"""
+    nz = sorted(r for r in samples if r > 1e-7)
+    if not nz:
+        return 0.0
+    # 取 25% 低分位（向下索引，避免线性插值被后续人声帧拉高）
+    idx = min(len(nz) - 1, max(0, int(len(nz) * 0.25)))
+    floor = nz[idx]
+    # 若最安静非零帧远低于 25% 分位，说明多数采样已混入人声，改用安静帧基线
+    if nz[0] * 2.5 < floor:
+        floor = nz[0]
+    return min(floor, MAX_NOISE_FLOOR)
 
 #: 配置目录。优先仓根 config/，其次模块同级 config/（兼容单文件使用）
 def _conf_dir() -> Path:
@@ -138,6 +158,9 @@ class VoiceInput:
             q.put(indata.copy())
 
         chunks: list[np.ndarray] = []
+        pre_buf: collections.deque[np.ndarray] = collections.deque(maxlen=PRE_BUFFER_CHUNKS)
+        calib_rms: list[float] = []
+        noise_window: collections.deque[float] = collections.deque(maxlen=40)
         noise_floor = 0.0
         noise_frames = 0
         started = False
@@ -157,22 +180,49 @@ class VoiceInput:
                         mono = mono * self.gain
                     rms = float(np.sqrt((mono ** 2).mean()))
 
-                    # 前 8 块（约 0.4 秒）测环境噪声。本机噪声约 0.0009，
-                    # 说话峰值约 0.01，阈值 0.0015 起步即可。
-                    if noise_frames < 8:
-                        noise_floor = max(noise_floor, rms)
+                    # 前 8 块（约 0.4 秒）测环境噪声，同时全部写入环形预缓冲不丢弃。
+                    # 改用低分位静默基线而非 max()，避免用户立刻开口时吞字或拉爆阈值。
+                    if noise_frames < CALIB_CHUNKS:
+                        pre_buf.append(mono)
+                        calib_rms.append(rms)
+                        noise_window.append(rms)
                         noise_frames += 1
                         if on_level:
                             on_level(rms, "calibrate")
+                        if noise_frames < CALIB_CHUNKS:
+                            continue
+                        noise_floor = _estimate_noise_floor(calib_rms)
+                        thresh = max(MIN_THRESH, noise_floor * NOISE_MULTIPLIER)
+                        if sum(1 for r in calib_rms if r > thresh) >= 2:
+                            started = True
+                            chunks.extend(pre_buf)
+                            pre_buf.clear()
+                            trailing_silent = 0
+                            for r in reversed(calib_rms):
+                                if r > thresh:
+                                    break
+                                trailing_silent += 1
+                            silent_run = trailing_silent * CHUNK
                         continue
-                    thresh = max(0.0015, noise_floor * 2.2)
+
+                    thresh = max(MIN_THRESH, noise_floor * NOISE_MULTIPLIER)
 
                     if not started:
                         if rms > thresh:
                             started = True
+                            if pre_buf:
+                                chunks.extend(pre_buf)
+                                pre_buf.clear()
                             chunks.append(mono)
-                        if on_level:
-                            on_level(rms, "wait")
+                            silent_run = 0.0
+                            if on_level:
+                                on_level(rms, "speak")
+                        else:
+                            pre_buf.append(mono)
+                            noise_window.append(rms)
+                            noise_floor = _estimate_noise_floor(list(noise_window))
+                            if on_level:
+                                on_level(rms, "wait")
                     else:
                         chunks.append(mono)
                         if rms > thresh:
@@ -181,7 +231,7 @@ class VoiceInput:
                             silent_run += CHUNK
                         if on_level:
                             on_level(rms, "speak")
-                        if silent_run >= silence_sec:
+                        if silent_run + 1e-9 >= silence_sec:
                             break
         except Exception as e:
             print(f"  [录音] {type(e).__name__}: {str(e)[:100]}")

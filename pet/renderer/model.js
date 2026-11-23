@@ -21,6 +21,76 @@ const BACKOFF = [500, 2000, 8000, 30000]
 // 默认上半身构图（直播用）；可在控制面板切全身/特写
 const CFG = { zoom: 1.6, viewY: 0.62, fps: 60, blink: true, idle: true }
 
+// ── 帧率策略与时间基准 ──
+// 降帧上限始终尊重用户配置的 CFG.fps（0 表示不限）；口型/指令活跃期间保活高帧率，
+// 避免直播窗口失焦后立刻陷入 8fps 导致口型/表情迟滞。
+const FPS_BLUR = 20
+const FPS_IDLE = 8
+const ACTIVE_HOLD_MS = 3000
+const IDLE_AFTER_MS = 30000
+const NOMINAL_FRAME_MS = 1000 / 60
+const MAX_DT_MS = 250
+
+let curFps = CFG.fps
+let lastAct = 0
+let activeUntil = 0
+
+function userFpsCap() {
+  if (CFG.fps == null || CFG.fps === '') return 60
+  const v = Number(CFG.fps)
+  return Number.isFinite(v) && v >= 0 ? v : 60
+}
+
+function parseOptionalMs(v) {
+  if (v == null || v === '') return NaN
+  const n = Number(v)
+  return Number.isFinite(n) ? n : NaN
+}
+
+function targetFpsForState(now = performance.now()) {
+  const cap = userFpsCap()
+  const focused = typeof document !== 'undefined' && typeof document.hasFocus === 'function'
+    ? document.hasFocus()
+    : true
+  if (focused || now < activeUntil) return cap === 0 ? 0 : cap
+  const target = (now - lastAct) > IDLE_AFTER_MS ? FPS_IDLE : FPS_BLUR
+  return cap === 0 ? target : Math.min(cap, target)
+}
+
+function setFps(n) {
+  // 不能只比较 curFps：ticker.maxFPS 可能被外部改过（调试/CFG 重设），
+  // 那样 curFps 相同就永远修不回来。两边都对齐才算无事可做。
+  if (curFps === n) {
+    try { if (app && app.ticker && app.ticker.maxFPS !== n) app.ticker.maxFPS = n } catch {}
+    return
+  }
+  curFps = n
+  try { if (app && app.ticker) app.ticker.maxFPS = n } catch {}
+  report('fps ' + n)
+}
+
+function syncFps(now = performance.now()) {
+  setFps(targetFpsForState(now))
+}
+
+function markActivity(holdMs = ACTIVE_HOLD_MS, now = performance.now()) {
+  lastAct = Math.max(lastAct, now)
+  if (holdMs > 0) activeUntil = Math.max(activeUntil, now + holdMs)
+  syncFps(now)
+}
+
+function stepDtMs(now, lastTs) {
+  if (!lastTs) return NOMINAL_FRAME_MS
+  const dt = now - lastTs
+  if (!(dt > 0)) return 0
+  return Math.min(dt, MAX_DT_MS)
+}
+
+function expAlpha(dtMs, tauMs) {
+  if (!(dtMs > 0) || !(tauMs > 0)) return 0
+  return 1 - Math.exp(-dtMs / tauMs)
+}
+
 function report(text) {
   try { document.title = 'model|' + text } catch {}
 }
@@ -40,7 +110,7 @@ function applyTransform() {
   model.y = bottomY * (1 - CFG.viewY)
 }
 
-function applyFps() { try { app.ticker.maxFPS = Number(CFG.fps) || 0 } catch {} }
+function applyFps() { syncFps(performance.now()) }
 
 function applyBlink() {
   if (!model) return
@@ -79,6 +149,7 @@ async function boot() {
   } catch {}
 
   applyTransform()
+  lastAct = performance.now()
   applyFps()
   applyBlink()
   window.addEventListener('resize', applyTransform)
@@ -133,7 +204,7 @@ async function boot() {
       const t = performance.now()
       try { pumpPose() } catch {}
       try { idleTick(t) } catch {}
-      try { pumpMouth() } catch {}
+      try { pumpMouth(t) } catch {}
     }
     report('姿态注入已挂载(update 之后)')
   } catch (e) {
@@ -178,43 +249,28 @@ async function boot() {
   // ── 帧率策略：按焦点与空闲程度降帧，长期挂机不吃 CPU ──
   // 实测结论：Electron 的 document.visibilityState 对「被别的窗口遮挡」不敏感
   //（遮挡时仍是 visible），只有最小化/隐藏才变 hidden。
-  // 所以降帧依据是 focus / hidden / 空闲时长，不是 visibilitychange 单独判断遮挡。
-  const FPS_ACTIVE = 60
-  const FPS_BLUR = 20
-  const FPS_IDLE = 8
-  let curFps = FPS_ACTIVE
-  let lastAct = performance.now()
-
-  function setFps(n) {
-    // 不能只比较 curFps：ticker.maxFPS 可能被外部改过（调试/CFG 重设），
-    // 那样 curFps 相同就永远修不回来。两边都对齐才算无事可做。
-    if (curFps === n) {
-      try { if (app.ticker.maxFPS !== n) app.ticker.maxFPS = n } catch {}
-      return
-    }
-    curFps = n
-    try { app.ticker.maxFPS = n } catch {}
-    report('fps ' + n)
-  }
+  // 所以降帧依据是 focus / hidden / 空闲时长，同时尊重用户设置的 CFG.fps 上限。
   // 暴露给调试与外部验证（也是真实使用中降帧策略的唯一入口）
-  window.__fps = { set: setFps, get: () => ({ cur: curFps, max: app.ticker.maxFPS, started: app.ticker.started }) }
+  window.__fps = {
+    set: setFps,
+    get: () => ({ cur: curFps, max: app.ticker.maxFPS, started: app.ticker.started, cfg: CFG.fps }),
+  }
 
   window.addEventListener('focus', () => {
     lastAct = performance.now()
     // 保险：任何一次 focus 都确保 ticker 在跑，防止 visibilitychange 停掉后再不恢复
     try { if (!app.ticker.started) app.ticker.start() } catch {}
-    setFps(FPS_ACTIVE)
+    syncFps(lastAct)
   })
-  window.addEventListener('blur', () => setFps(FPS_BLUR))
+  window.addEventListener('blur', () => syncFps())
   for (const ev of ['mousemove', 'mousedown', 'wheel', 'keydown']) {
     window.addEventListener(ev, () => { lastAct = performance.now() }, { passive: true })
   }
 
-  // 空闲降帧：失焦且 30 秒没交互就降到 8fps
+  // 空闲降帧：失焦且超过 30 秒无窗口交互/口型/指令活动就降到 8fps（上限仍受 CFG.fps 约束）
   setInterval(() => {
     if (!document.hasFocus()) {
-      const idle = performance.now() - lastAct
-      setFps(idle > 30000 ? FPS_IDLE : FPS_BLUR)
+      syncFps()
     }
   }, 5000)
 
@@ -227,7 +283,7 @@ async function boot() {
     } else {
       try { app.ticker.start() } catch {}
       lastAct = performance.now()
-      setFps(FPS_ACTIVE)
+      syncFps(lastAct)
     }
   })
 
@@ -236,7 +292,7 @@ async function boot() {
     try {
       if (!document.hidden && !app.ticker.started) {
         app.ticker.start()
-        setFps(document.hasFocus() ? FPS_ACTIVE : FPS_BLUR)
+        syncFps()
       }
     } catch {}
   }, 10000)
@@ -246,10 +302,31 @@ async function boot() {
 }
 
 // ── 指令 ──
-function setExpression(name) {
+const EXTERNAL_EXPR_HOLD_MS = 6000  // 外部下发表情保护窗口（避免台词说到一半被待机覆盖）
+const SPEAKING_HOLD_MS = 1500       // 口型活跃后的说话态驻留窗口
+let externalExprUntil = 0
+let speakingUntil = 0
+
+function setExpression(name, opts) {
   if (!model) return false
-  try { model.expression(name); report('表情 ' + name); return true }
-  catch { return false }
+  const isIdle = !!(opts && opts.fromIdle)
+  try {
+    model.expression(name)
+    report('表情 ' + name)
+    if (!isIdle) {
+      const now = performance.now()
+      const parsedHold = parseOptionalMs(opts && opts.holdMs)
+      const holdMs = Number.isFinite(parsedHold) && parsedHold >= 0
+        ? parsedHold
+        : EXTERNAL_EXPR_HOLD_MS
+      idleActivity.expr = null
+      externalExprUntil = Math.max(externalExprUntil, now + holdMs)
+      idleActivity.nextExprAt = Math.max(idleActivity.nextExprAt, externalExprUntil + rand(4000, 8000))
+    }
+    return true
+  } catch {
+    return false
+  }
 }
 function playMotion(group, index) {
   if (!model) return false
@@ -276,15 +353,49 @@ const idleActivity = {
   exprUntil: 0,
 }
 const IDLE_EXPRS = ['微笑', '眯眼', '眨单眼', '挑眉', '笑眼']   // 只换轻表情，不用黑脸/流泪
+const GAZE_TAU_MS = 408           // 等效 60fps 下每帧 0.04 趋近速率
+let lastIdleTs = 0
 
-//: 头部角度历史，用来给头发做惯性延迟（头发不自己摆，跟着头滞后甩）
+//: 头部角度时间戳历史，用来给头发做帧率无关的惯性延迟（跟着头滞后甩）
 const headHist = []
-const HEAD_LAG = 7      // 滞后帧数：越大甩得越慢
+const HEAD_LAG_MS = 117           // 基础滞后约 117ms（等效 60fps 下 7 帧）
+const HEAD_LAYER_STEP_MS = 17     // 每层外延滞后 ~17ms（等效 60fps 下 +1 帧）
+const HEAD_HIST_MAX_MS = 1000     // 历史窗口保留 1 秒
+
+function recordHeadHist(now, x, y) {
+  if (headHist.length && (now < headHist[headHist.length - 1].t || (now - headHist[headHist.length - 1].t) > HEAD_HIST_MAX_MS)) {
+    headHist.length = 0
+  }
+  headHist.push({ t: now, x, y })
+  const cutoff = now - HEAD_HIST_MAX_MS
+  while (headHist.length > 2 && headHist[1].t < cutoff) {
+    headHist.shift()
+  }
+}
+
+function sampleHeadHist(targetT) {
+  const n = headHist.length
+  if (!n) return { x: 0, y: 0 }
+  if (targetT <= headHist[0].t) return { x: headHist[0].x, y: headHist[0].y }
+  if (targetT >= headHist[n - 1].t) return { x: headHist[n - 1].x, y: headHist[n - 1].y }
+  for (let j = n - 2; j >= 0; j--) {
+    const a = headHist[j]
+    const b = headHist[j + 1]
+    if (a.t <= targetT && targetT <= b.t) {
+      const span = b.t - a.t
+      const u = span > 0 ? (targetT - a.t) / span : 0
+      return { x: a.x + (b.x - a.x) * u, y: a.y + (b.y - a.y) * u }
+    }
+  }
+  return { x: headHist[0].x, y: headHist[0].y }
+}
 
 function rand(a, b) { return a + Math.random() * (b - a) }
 
-function idleTick(now) {
+function idleTick(now = performance.now()) {
   if (!idleActivity.enabled || !model) return
+  const dtMs = stepDtMs(now, lastIdleTs)
+  lastIdleTs = now
   const core = model.internalModel.coreModel
   const poseActive = now < poseUntil
 
@@ -325,13 +436,12 @@ function idleTick(now) {
       core.setParameterValueById('Hat_XA', nx * 0.45)
       core.setParameterValueById('Hat_YA', ny * 0.40)
 
-      // 头发：不自己摆，跟着头部角度滞后甩（惯性）。同样要归一化。
-      headHist.push({ x: nx, y: ny })
-      if (headHist.length > 24) headHist.shift()
+      // 头发：按时间戳采样头部历史，保证降帧时惯性滞后时间恒定不拖慢。
+      recordHeadHist(now, nx, ny)
       for (let i = 1; i <= 4; i++) {
         // 越外层（i 大）甩得越多、滞后越久
         const k = 0.35 + i * 0.15
-        const ref = headHist[Math.max(0, headHist.length - HEAD_LAG - i)] || { x: 0, y: 0 }
+        const ref = sampleHeadHist(now - (HEAD_LAG_MS + (i - 1) * HEAD_LAYER_STEP_MS))
         try {
           core.setParameterValueById('FrontHairX' + i, Math.max(-0.8, Math.min(0.8, ref.x * k)))
           core.setParameterValueById('FrontHairY' + i, Math.max(-0.8, Math.min(0.8, ref.y * k * 0.6)))
@@ -343,14 +453,15 @@ function idleTick(now) {
     } catch {}
   }
 
-  // ② 视线游移：每 3~6 秒换一个注视点，缓慢趋近
+  // ② 视线游移：每 3~6 秒换一个注视点，按 dt 指数平滑趋近
   if (now > idleActivity.nextGazeAt) {
     idleActivity.gazeTarget = { x: rand(-0.8, 0.8), y: rand(-0.5, 0.5) }
     idleActivity.nextGazeAt = now + rand(3000, 6000)
   }
   if (!poseActive) {
-    idleActivity.gaze.x += (idleActivity.gazeTarget.x - idleActivity.gaze.x) * 0.04
-    idleActivity.gaze.y += (idleActivity.gazeTarget.y - idleActivity.gaze.y) * 0.04
+    const gazeAlpha = expAlpha(dtMs, GAZE_TAU_MS)
+    idleActivity.gaze.x += (idleActivity.gazeTarget.x - idleActivity.gaze.x) * gazeAlpha
+    idleActivity.gaze.y += (idleActivity.gazeTarget.y - idleActivity.gaze.y) * gazeAlpha
     try {
       core.setParameterValueById('ParamEyeBallX', idleActivity.gaze.x)
       core.setParameterValueById('ParamEyeBallY', idleActivity.gaze.y)
@@ -358,15 +469,22 @@ function idleTick(now) {
   }
 
   // ③ 偶尔换个轻表情：每 9~16 秒一次，持续 3~5 秒回默认
-  if (now > idleActivity.nextExprAt) {
+  // 外部表情保护期内、说话中或姿态活跃时暂停随机切换与复位，避免打断台词情绪。
+  const speaking = now < speakingUntil || mouthValue > 0.01 || mouthSmooth > 0.01
+  const exprLocked = now < externalExprUntil || speaking || poseActive
+  if (exprLocked) {
+    if (idleActivity.nextExprAt < now + 1500) {
+      idleActivity.nextExprAt = now + 1500
+    }
+  } else if (now > idleActivity.nextExprAt) {
     if (idleActivity.expr) {
       // 回默认
-      setExpression('默认体型')
+      setExpression('默认体型', { fromIdle: true })
       idleActivity.expr = null
       idleActivity.nextExprAt = now + rand(9000, 16000)
     } else {
       const name = IDLE_EXPRS[Math.floor(Math.random() * IDLE_EXPRS.length)]
-      setExpression(name)
+      setExpression(name, { fromIdle: true })
       idleActivity.expr = name
       idleActivity.nextExprAt = now + rand(3000, 5000)
     }
@@ -418,25 +536,38 @@ function pumpPose() {
 }
 
 // 桥推送 0-100，模型参数 0-1。
-// mouthValue 是目标值，mouthSmooth 是每帧插值后的实际值——
-// 直接赋值会让嘴一帧跳到位，看起来是抽搐而不是说话。
+// mouthValue 是目标值，mouthSmooth 是按 dt 指数平滑后的实际值——
+// 既避免一帧跳到位显得抽搐，也保证 8fps 降帧时不会变成慢动作粘滞。
 let mouthValue = 0
 let mouthSmooth = 0
-// 张开和闭合用不同速率：张太快显得机械，合太快像抽筋。
-// 张开跟手（0.55），闭合柔和（0.12，约 8-10 帧 = 130~170ms），说话才有黏连感。
-const MOUTH_OPEN_EASE = 0.55
-const MOUTH_CLOSE_EASE = 0.12
+let lastMouthTs = 0
+// 张开和闭合用不同时间常数：张开跟手（~21ms，等效 60fps 下 0.55），
+// 闭合柔和（~130ms，等效 60fps 下 0.12，收尾 ~130~170ms）。
+const MOUTH_OPEN_TAU_MS = 21
+const MOUTH_CLOSE_TAU_MS = 130
 
 function setMouth(v) {
+  if (v == null || v === '') return
   const n = Number(v)
   if (!Number.isFinite(n)) return
-  mouthValue = Math.max(0, Math.min(1, n / 100))
+  const nextVal = Math.max(0, Math.min(1, n / 100))
+  const now = performance.now()
+  mouthValue = nextVal
+  if (nextVal > 0.01) {
+    speakingUntil = Math.max(speakingUntil, now + SPEAKING_HOLD_MS)
+    markActivity(ACTIVE_HOLD_MS, now)
+  } else {
+    lastAct = Math.max(lastAct, now)
+  }
 }
 
-function pumpMouth() {
+function pumpMouth(now = performance.now()) {
   if (!model) return
-  const ease = mouthValue > mouthSmooth ? MOUTH_OPEN_EASE : MOUTH_CLOSE_EASE
-  mouthSmooth += (mouthValue - mouthSmooth) * ease
+  const dtMs = stepDtMs(now, lastMouthTs)
+  lastMouthTs = now
+  const tau = mouthValue > mouthSmooth ? MOUTH_OPEN_TAU_MS : MOUTH_CLOSE_TAU_MS
+  const alpha = expAlpha(dtMs, tau)
+  mouthSmooth += (mouthValue - mouthSmooth) * alpha
   // 收尾：目标与当前都接近 0 时直接归零，避免浮点残留微张
   if (mouthValue < 0.01 && mouthSmooth < 0.01) mouthSmooth = 0
   try {
@@ -454,9 +585,16 @@ async function pollOnce() {
     const cmd = await res.json()
     if (cmd && cmd.seq !== lastSeq) {
       lastSeq = cmd.seq
+      const cmdMs = parseOptionalMs(cmd.ms)
+      const hold = cmd.kind === 'pose' && Number.isFinite(cmdMs) && cmdMs > 0
+        ? Math.max(ACTIVE_HOLD_MS, cmdMs)
+        : ACTIVE_HOLD_MS
+      markActivity(hold)
       if (cmd.kind === 'motion') playMotion(cmd.group || 'Gesture', cmd.index || 0)
       else if (cmd.kind === 'pose' && cmd.params) applyPose(cmd.params, cmd.ms)
-      else if (typeof cmd.name === 'string' && cmd.name) setExpression(cmd.name)
+      else if (typeof cmd.name === 'string' && cmd.name) {
+        setExpression(cmd.name, Number.isFinite(cmdMs) && cmdMs > 0 ? { holdMs: cmdMs } : undefined)
+      }
     }
     schedulePoll(BACKOFF[0])
   } catch {
@@ -470,7 +608,7 @@ function openMouthStream() {
   try {
     const es = new EventSource(BRIDGE + '/mouth-stream')
     es.addEventListener('message', ev => {
-      const v = Number(ev.data); if (Number.isFinite(v)) setMouth(v)
+      setMouth(ev.data)
     })
     es.addEventListener('error', () => { es.close(); setTimeout(openMouthStream, 3000) })
   } catch {}
@@ -481,15 +619,24 @@ window.addEventListener('relay-cfg', (e) => {
   const c = e.detail || {}
   if (Number.isFinite(c.zoom)) CFG.zoom = c.zoom
   if (Number.isFinite(c.viewY)) CFG.viewY = c.viewY
-  if (Number.isFinite(c.fps)) { CFG.fps = c.fps; applyFps() }
+  if (Number.isFinite(c.fps) && c.fps >= 0) {
+    CFG.fps = c.fps
+    markActivity(ACTIVE_HOLD_MS)
+    applyFps()
+  }
   if (typeof c.blink === 'boolean') { CFG.blink = c.blink; applyBlink() }
   applyTransform()
   report('cfg ' + JSON.stringify(c).slice(0, 40))
 })
 window.addEventListener('relay-cmd', (e) => {
   const c = e.detail || {}
-  if (c.type === 'expr' && c.name) setExpression(c.name)
-  else if (c.type === 'motion') playMotion(c.group, c.index)
+  if (c.type === 'expr' && c.name) {
+    markActivity(ACTIVE_HOLD_MS)
+    setExpression(c.name)
+  } else if (c.type === 'motion') {
+    markActivity(ACTIVE_HOLD_MS)
+    playMotion(c.group, c.index)
+  }
 })
 window.addEventListener('relay-zoom', (e) => {
   const z = Number((e.detail || {}).zoom)
